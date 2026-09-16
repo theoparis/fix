@@ -152,12 +152,33 @@ pub const DaemonStore = struct {
                 self.initSocketTransport(stream);
             },
             .unix => |target| {
-                const owned_path = if (target.append_legacy_socket)
-                    try std.fs.path.join(self.allocator, &.{ target.path, "socket" })
+                const cwd = std.process.currentPathAlloc(io, self.allocator) catch null;
+                defer if (cwd) |c| self.allocator.free(c);
+
+                const abs_path = if (std.fs.path.isAbsolute(target.path))
+                    try self.allocator.dupe(u8, target.path)
+                else if (cwd) |c|
+                    try std.fs.path.resolve(self.allocator, &.{ c, target.path })
+                else
+                    try self.allocator.dupe(u8, target.path);
+                defer self.allocator.free(abs_path);
+
+                var socket_path: []const u8 = abs_path;
+                var owned_path: ?[]u8 = if (target.append_legacy_socket)
+                    try std.fs.path.join(self.allocator, &.{ abs_path, "socket" })
                 else
                     null;
                 defer if (owned_path) |path| self.allocator.free(path);
-                const addr = try std.Io.net.UnixAddress.init(owned_path orelse target.path);
+
+                if (owned_path == null) {
+                    if (std.Io.Dir.openDirAbsolute(io, abs_path, .{}) catch null) |dir| {
+                        dir.close(io);
+                        owned_path = try std.fs.path.join(self.allocator, &.{ abs_path, "socket" });
+                        socket_path = owned_path.?;
+                    }
+                }
+
+                const addr = try std.Io.net.UnixAddress.init(owned_path orelse socket_path);
                 self.initSocketTransport(try addr.connect(io));
             },
         }

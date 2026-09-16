@@ -8,10 +8,15 @@ pub const pool = @import("daemon/pool.zig");
 pub const build_events = @import("daemon/build_events.zig");
 pub const settings = @import("daemon/settings.zig");
 pub const backend_adapter = @import("daemon/backend.zig");
+pub const server = @import("daemon/server.zig");
+pub const sandbox = @import("daemon/sandbox.zig");
 
 const backend = @import("backend.zig");
 
 pub const DaemonStore = client.DaemonStore;
+pub const Server = server.Server;
+pub const SandboxMode = sandbox.SandboxMode;
+pub const SandboxOptions = sandbox.SandboxOptions;
 pub const BuildEvent = backend.BuildEvent;
 pub const BuildSink = backend.BuildSink;
 pub const BuildMode = backend.BuildMode;

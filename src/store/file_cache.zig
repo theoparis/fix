@@ -27,7 +27,7 @@ pub const FileCache = struct {
     /// lookup / insert, never across I/O.
     map_mu: sync.BlockingMutex = .{},
 
-    const max_read_bytes = 128 * 1024 * 1024;
+    const max_read_bytes = 2048 * 1024 * 1024;
 
     pub const FileKind = enum {
         regular,

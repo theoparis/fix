@@ -199,8 +199,13 @@ fn configureEngine(
     try applyNetrc(ev, init, settings);
     // The store directory follows `store-dir` from nix.conf, with `NIX_STORE_DIR`
     // taking precedence (as Nix does for this setting). Defaults to `/nix/store`.
-    if (init.environ_map.get("NIX_STORE_DIR") orelse settings.get("store-dir")) |dir|
+    if (init.environ_map.get("NIX_STORE_DIR") orelse settings.get("store-dir")) |dir| {
         try ev.setStoreDir(dir);
+    } else if (settings.get("store")) |uri| {
+        if (uri.len != 0 and !std.mem.eql(u8, uri, "daemon") and std.mem.indexOf(u8, uri, "://") == null) {
+            try ev.setStoreDir(uri);
+        }
+    }
     // A nonstandard state directory moves the default daemon socket for both
     // Nix and Lix. An explicit socket path still wins.
     if (init.environ_map.get("NIX_DAEMON_SOCKET_PATH")) |sock| {

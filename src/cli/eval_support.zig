@@ -345,7 +345,7 @@ fn flakeProfile(cmd: args.Cmd) FlakeProfile {
         // Value commands resolve the attr path from the flake root, as Nix's
         // `nix eval .#a.b` does, with packages as a convenience fallback.
         .eval, .parse, .instantiate, .repl, .disasm => .{ .namespaces = &.{ "packages", "legacyPackages" }, .root_first = true, .default_attr = null },
-        .completions, .flake, .thunks, .trace => unreachable,
+        .completions, .daemon, .flake, .thunks, .trace => unreachable,
     };
 }
 

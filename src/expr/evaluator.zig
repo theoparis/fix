@@ -2625,7 +2625,7 @@ pub const Engine = struct {
     /// is local, else via the daemon (`NarFromPath`) for a remote store. Used to
     /// read a get-env derivation's `$out` back regardless of store location.
     pub fn readStorePathFile(self: *Engine, io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-        if (std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(256 << 20))) |data| {
+        if (std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(4096 << 20))) |data| {
             return data;
         } else |err| switch (err) {
             error.FileNotFound => {}, // not on this machine — a remote store

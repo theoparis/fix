@@ -3,6 +3,7 @@
 pub const Kind = enum {
     build,
     completions,
+    daemon,
     disasm,
     eval,
     flake,
@@ -36,6 +37,7 @@ pub fn enabled(kind: Kind) bool {
 pub const table = [_]Command{
     .{ .kind = .build, .name = "build", .summary = "evaluate to a derivation, build its outputs, and link ./result", .args_cmd = .build },
     .{ .kind = .completions, .name = "completions", .summary = "generate shell completions for bash, zsh, or fish", .args_cmd = null },
+    .{ .kind = .daemon, .name = "daemon", .summary = "run a Nix-compatible worker-protocol daemon server", .args_cmd = null },
     .{ .kind = .disasm, .name = "disasm", .summary = "disassemble compiled bytecode for an expression", .args_cmd = .disasm },
     .{ .kind = .eval, .name = "eval", .summary = "evaluate an expression, file, or flake output and print the value", .args_cmd = .eval },
     .{ .kind = .flake, .name = "flake", .summary = "inspect and manage flakes (metadata, show, check, update, lock)", .args_cmd = null },
