@@ -27,6 +27,7 @@ Each is a self-contained tool with its own `-h`. `eval`/`repl` evaluate expressi
 | `disasm` | decompile bytecode per-chunk with source-span, constant, and local/upvalue-name annotation | [compiler/pipeline.md](compiler/pipeline.md), [vm/dispatch.md](vm/dispatch.md) |
 | `eval` | evaluate mixed expression/file/flake inputs and render each value | — |
 | `flake metadata\|show\|check\|update\|lock [flakeref]` | inspect and manage a flake (see below) | — |
+| `gc` | delete store paths unreachable from the GC root set (see below) | — |
 | `instantiate` | evaluate to a derivation and add its `.drv` closure to the store (à la `nix-instantiate`) | [derivation/model.md](derivation/model.md) |
 | `parse` | parse and statically validate an expression, then print the `nix-instantiate --parse` JSON AST | [syntax/parsing.md](syntax/parsing.md) |
 | `print-dev-env` | evaluate a derivation and emit its build environment as a Bash program (used by `use fix`) | — |
@@ -36,6 +37,22 @@ Each is a self-contained tool with its own `-h`. `eval`/`repl` evaluate expressi
 | `switch` | build and activate a NixOS, nix-darwin, or home-manager configuration | — |
 | `trace dump PATH` / `trace diff A B` | read binary VM-execution trace files: `dump` pretty-prints one as text; `diff` walks two in lockstep to the first divergent event (`-Dvm-trace` builds only) | [vm/dispatch.md](vm/dispatch.md) |
 | `thunks diff A B` | diff two thunk-resolution logs → first divergence by source location (`-Dthunks-log` builds only) | below |
+
+## Store garbage collection
+
+`fix gc [--store-dir DIR] [--gcroots DIR] [--dry-run]` reclaims top-level store
+entries unreachable from the GC root set. Roots are the symlinks under the
+gcroots directory (default `<store-dir>/gcroots`, or `$NIX_STATE_DIR/gcroots`
+for `/nix/store`); reachability follows each entry's references, obtained by
+scanning its file contents for store paths (a `.drv` therefore keeps its input
+derivations, sources, and outputs). `--dry-run` lists what would be deleted
+without touching the store. A non-entry file such as the daemon's `socket` is
+never considered.
+
+The `fix daemon` server records `add_temp_root` (kept in memory) and
+`add_indirect_root` (as `gcroots/auto/<hash>` links) and shares the same
+collector. `--gc` runs one collection and exits; `--gc-interval SECS` runs one
+every N seconds while serving, but only when no connection is mid-write.
 
 ## The repl
 

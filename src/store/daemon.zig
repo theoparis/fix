@@ -7,6 +7,7 @@ pub const client = @import("daemon/client.zig");
 pub const pool = @import("daemon/pool.zig");
 pub const build_events = @import("daemon/build_events.zig");
 pub const settings = @import("daemon/settings.zig");
+pub const gc = @import("daemon/gc.zig");
 pub const backend_adapter = @import("daemon/backend.zig");
 pub const server = @import("daemon/server.zig");
 pub const sandbox = @import("daemon/sandbox.zig");
@@ -32,5 +33,7 @@ test {
     _ = endpoint;
     _ = build_events;
     _ = settings;
+    _ = gc;
+    _ = server;
     _ = backend_adapter;
 }

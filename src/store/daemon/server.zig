@@ -10,6 +10,7 @@ const sync = @import("base").sync;
 const owned_strings = @import("base").owned_strings;
 const wire = @import("wire.zig");
 const sandbox = @import("sandbox.zig");
+const store_gc = @import("gc.zig");
 
 var global_build_counter: std.atomic.Value(u64) = .init(1);
 
@@ -27,12 +28,24 @@ pub const Server = struct {
     mu: sync.BlockingMutex = .{},
     valid_paths: std.StringHashMapUnmanaged(void) = .empty,
     queried_names: std.StringHashMapUnmanaged([]const u8) = .empty,
+    /// Owned gcroots directory (`<store-dir>/gcroots` unless overridden).
+    gcroots_dir: []const u8,
+    /// Owned absolute store paths pinned by `add_temp_root` (op 11). Kept in
+    /// memory for the server's lifetime; the periodic collector includes them.
+    temp_roots: std.StringHashMapUnmanaged(void) = .empty,
+    gc_interval_seconds: u64 = 0,
+    gc_thread: ?std.Thread = null,
+    /// Live worker connections. The periodic collector only runs when this is
+    /// zero, so it never races an in-flight write.
+    active_conns: std.atomic.Value(usize) = .init(0),
 
     pub const Options = struct {
         store_dir: []const u8 = ".fix/store",
         socket_path: ?[]const u8 = null,
         sandbox_mode: sandbox.SandboxMode = .none,
         chroot_dir: ?[]const u8 = null,
+        gcroots_dir: ?[]const u8 = null,
+        gc_interval_seconds: u64 = 0,
     };
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Server {
@@ -57,6 +70,15 @@ pub const Server = struct {
             try std.fs.path.join(allocator, &.{ owned_store_dir, "socket" });
         errdefer allocator.free(socket_path);
 
+        const gcroots_dir = if (options.gcroots_dir) |g|
+            (if (std.fs.path.isAbsolute(g))
+                try allocator.dupe(u8, g)
+            else
+                try std.fs.path.resolve(allocator, &.{ cwd, g }))
+        else
+            try std.fs.path.join(allocator, &.{ owned_store_dir, "gcroots" });
+        errdefer allocator.free(gcroots_dir);
+
         self.* = .{
             .allocator = allocator,
             .io = io,
@@ -64,6 +86,8 @@ pub const Server = struct {
             .socket_path = socket_path,
             .sandbox_mode = options.sandbox_mode,
             .chroot_dir = if (options.chroot_dir) |c| try allocator.dupe(u8, c) else null,
+            .gcroots_dir = gcroots_dir,
+            .gc_interval_seconds = options.gc_interval_seconds,
         };
 
         // Ensure store directory exists
@@ -75,6 +99,7 @@ pub const Server = struct {
     pub fn deinit(self: *Server) void {
         if (self.chroot_dir) |c| self.allocator.free(c);
         self.shutdown.store(true, .release);
+        if (self.gc_thread) |t| t.join();
         if (self.server) |*srv| {
             // Wake accept loop if running
             if (self.socket_path.len != 0) {
@@ -101,10 +126,15 @@ pub const Server = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.queried_names.deinit(self.allocator);
+
+        var temp_it = self.temp_roots.keyIterator();
+        while (temp_it.next()) |p| self.allocator.free(p.*);
+        self.temp_roots.deinit(self.allocator);
         self.mu.unlock();
 
         self.allocator.free(self.store_dir);
         self.allocator.free(self.socket_path);
+        self.allocator.free(self.gcroots_dir);
         self.allocator.destroy(self);
     }
 
@@ -120,6 +150,7 @@ pub const Server = struct {
         const address = try std.Io.net.UnixAddress.init(self.socket_path);
         var server = try address.listen(self.io, .{});
         self.server = server;
+        try self.startGcThread();
 
         while (!self.shutdown.load(.acquire)) {
             const stream = server.accept(self.io) catch |err| {
@@ -168,7 +199,8 @@ pub const Server = struct {
                 .add_to_store => try self.handleAdd(input, output),
                 .add_text_to_store => try self.handleAddText(input, output),
                 .build_paths => try self.handleBuild(input, output),
-                .add_indirect_root, .add_temp_root => try self.handleRoots(input, output),
+                .add_indirect_root => try self.handleRoots(.add_indirect_root, input, output),
+                .add_temp_root => try self.handleRoots(.add_temp_root, input, output),
                 .nar_from_path => try self.handleNarFromPath(input, output),
                 else => {
                     try writeDaemonError(output, "unsupported worker protocol operation");
@@ -178,6 +210,8 @@ pub const Server = struct {
     }
 
     fn serveConn(self: *Server, stream: std.Io.net.Stream) void {
+        _ = self.active_conns.fetchAdd(1, .monotonic);
+        defer _ = self.active_conns.fetchSub(1, .monotonic);
         defer stream.close(self.io);
         var read_buffer: [64 * 1024]u8 = undefined;
         var write_buffer: [64 * 1024]u8 = undefined;
@@ -358,13 +392,99 @@ pub const Server = struct {
         try output.flush();
     }
 
-    fn handleRoots(self: *Server, input: *std.Io.Reader, output: *std.Io.Writer) !void {
-        _ = self;
-        const link_path = try wire.readString(std.heap.page_allocator, input);
-        defer std.heap.page_allocator.free(link_path);
+    fn handleRoots(self: *Server, op: wire.Op, input: *std.Io.Reader, output: *std.Io.Writer) !void {
+        const path = try wire.readString(self.allocator, input);
+        defer self.allocator.free(path);
+        switch (op) {
+            .add_temp_root => {
+                self.mu.lock();
+                defer self.mu.unlock();
+                if (!self.temp_roots.contains(path)) {
+                    const owned = try self.allocator.dupe(u8, path);
+                    errdefer self.allocator.free(owned);
+                    try self.temp_roots.put(self.allocator, owned, {});
+                }
+            },
+            .add_indirect_root => self.recordIndirectRoot(path) catch |err| {
+                const msg = try std.fmt.allocPrint(self.allocator, "cannot add GC root '{s}': {s}", .{ path, @errorName(err) });
+                defer self.allocator.free(msg);
+                return writeDaemonError(output, msg);
+            },
+            else => unreachable,
+        }
         try wire.writeInt(output, wire.stderr_last);
         try wire.writeInt(output, 1);
         try output.flush();
+    }
+
+    /// Persist an indirect root as `gcroots/auto/<sha256(link_path)> -> link_path`,
+    /// mirroring Nix's `IndirectRootStore::addIndirectRoot`. The link path is a
+    /// user-owned symlink; the collector follows it to the store path.
+    fn recordIndirectRoot(self: *Server, link_path: []const u8) !void {
+        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(link_path, &digest, .{});
+        const hex = std.fmt.bytesToHex(digest, .lower);
+        const auto_dir = try std.fs.path.join(self.allocator, &.{ self.gcroots_dir, "auto" });
+        defer self.allocator.free(auto_dir);
+        try std.Io.Dir.cwd().createDirPath(self.io, auto_dir);
+        const link = try std.fs.path.join(self.allocator, &.{ auto_dir, &hex });
+        defer self.allocator.free(link);
+        std.Io.Dir.deleteFileAbsolute(self.io, link) catch {};
+        try std.Io.Dir.cwd().symLink(self.io, link_path, link, .{});
+    }
+
+    /// Run one collection over this server's store, seeded with the live temp
+    /// roots. Safe to call at any time; callers wanting isolation should first
+    /// ensure `active_conns` is zero.
+    pub fn collectGarbage(self: *Server, dry_run: bool) !store_gc.Report {
+        var roots: std.ArrayListUnmanaged([]u8) = .empty;
+        defer {
+            for (roots.items) |root| self.allocator.free(root);
+            roots.deinit(self.allocator);
+        }
+        self.mu.lock();
+        {
+            var it = self.temp_roots.keyIterator();
+            while (it.next()) |p| {
+                const owned = self.allocator.dupe(u8, p.*) catch continue;
+                roots.append(self.allocator, owned) catch self.allocator.free(owned);
+            }
+        }
+        self.mu.unlock();
+
+        var collector = try store_gc.Gc.init(self.allocator, self.io, self.store_dir, self.gcroots_dir);
+        defer collector.deinit();
+        for (roots.items) |root| collector.addRoot(root) catch {};
+        _ = try collector.addIndirectRoots();
+        return collector.run(dry_run);
+    }
+
+    fn startGcThread(self: *Server) !void {
+        if (self.gc_interval_seconds == 0) return;
+        self.gc_thread = try std.Thread.spawn(.{}, gcLoop, .{self});
+    }
+
+    fn gcLoop(self: *Server) void {
+        const interval = self.gc_interval_seconds;
+        while (!self.shutdown.load(.acquire)) {
+            var slept: u64 = 0;
+            while (slept < interval and !self.shutdown.load(.acquire)) {
+                const slice: u64 = @min(1, interval - slept);
+                std.Io.sleep(self.io, std.Io.Duration.fromSeconds(@intCast(slice)), .awake) catch {};
+                slept += slice;
+            }
+            if (self.shutdown.load(.acquire)) break;
+            // Never collect while a connection is mid-write.
+            if (self.active_conns.load(.acquire) != 0) continue;
+            var report = self.collectGarbage(false) catch |err| {
+                std.debug.print("fix-daemon gc error: {s}\n", .{@errorName(err)});
+                continue;
+            };
+            defer report.deinit();
+            if (report.freedCount() != 0) {
+                std.debug.print("fix-daemon gc: freed {d} paths ({d} bytes), {d} live\n", .{ report.freedCount(), report.freed_bytes, report.live_count });
+            }
+        }
     }
 
     fn handleNarFromPath(self: *Server, input: *std.Io.Reader, output: *std.Io.Writer) !void {
@@ -1033,4 +1153,47 @@ pub fn parseATerm(parent_allocator: std.mem.Allocator, text: []const u8) !Parsed
         .args = args,
         .env = env,
     };
+}
+
+test "daemon records an indirect root and collects around it" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try std.process.currentPathAlloc(t.io, t.allocator);
+    defer t.allocator.free(cwd);
+    const base = try std.fs.path.resolve(t.allocator, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    defer t.allocator.free(base);
+    const store_dir = try std.fs.path.join(t.allocator, &.{ base, "store" });
+    defer t.allocator.free(store_dir);
+    const gcroots_dir = try std.fs.path.join(t.allocator, &.{ base, "gcroots" });
+    defer t.allocator.free(gcroots_dir);
+    try std.Io.Dir.cwd().createDirPath(t.io, store_dir);
+    try std.Io.Dir.cwd().createDirPath(t.io, gcroots_dir);
+
+    const a_path = try std.fs.path.join(t.allocator, &.{ store_dir, "00000000000000000000000000000000-a" });
+    defer t.allocator.free(a_path);
+    const b_path = try std.fs.path.join(t.allocator, &.{ store_dir, "11111111111111111111111111111111-b" });
+    defer t.allocator.free(b_path);
+    const c_path = try std.fs.path.join(t.allocator, &.{ store_dir, "22222222222222222222222222222222-c" });
+    defer t.allocator.free(c_path);
+    const content = try std.fmt.allocPrint(t.allocator, "dep = {s}\n", .{b_path});
+    defer t.allocator.free(content);
+    try std.Io.Dir.cwd().writeFile(t.io, .{ .sub_path = a_path, .data = content });
+    try std.Io.Dir.cwd().writeFile(t.io, .{ .sub_path = b_path, .data = "leaf\n" });
+    try std.Io.Dir.cwd().writeFile(t.io, .{ .sub_path = c_path, .data = "junk\n" });
+
+    // A user `./result` link registered as an indirect root.
+    const result_link = try std.fs.path.join(t.allocator, &.{ base, "result" });
+    defer t.allocator.free(result_link);
+    try std.Io.Dir.cwd().symLink(t.io, a_path, result_link, .{});
+
+    var server = try Server.init(t.allocator, t.io, .{ .store_dir = store_dir, .gcroots_dir = gcroots_dir });
+    defer server.deinit();
+    try server.recordIndirectRoot(result_link);
+    var report = try server.collectGarbage(false);
+    defer report.deinit();
+    try t.expectEqual(@as(usize, 2), report.live_count); // a + b
+    try t.expectEqual(@as(usize, 1), report.root_count);
+    try t.expectEqual(@as(usize, 1), report.freedCount()); // c
+    try t.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(t.io, c_path, .{ .follow_symlinks = false }));
 }

@@ -11,6 +11,7 @@ pub const Runner = *const fn (ProcessContext, std.process.Init, *std.process.Arg
 pub const eval = @import("eval.zig");
 pub const daemon = @import("daemon.zig");
 pub const flake = @import("flake.zig");
+pub const gc = @import("gc.zig");
 pub const completions = @import("completions.zig");
 pub const parse = @import("parse.zig");
 pub const print_dev_env = @import("print_dev_env.zig");
@@ -34,6 +35,7 @@ pub fn runner(comptime kind: command_meta.Kind) Runner {
         .disasm => disasm.run,
         .eval => eval.run,
         .flake => flake.run,
+        .gc => gc.run,
         .instantiate => instantiate.run,
         .parse => parse.run,
         .print_dev_env => print_dev_env.run,

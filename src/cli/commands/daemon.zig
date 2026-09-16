@@ -15,6 +15,9 @@ pub const synopsis =
     \\  --socket <path>      path to Unix domain socket to bind (default: <store-dir>/socket)
     \\  --sandbox <mode>     build sandbox mode: none, relaxed, pure, chroot (default: none)
     \\  --chroot <dir>       root directory for chroot builds
+    \\  --gcroots <dir>      GC-root link directory (default: <store-dir>/gcroots)
+    \\  --gc-interval <secs> collect unreachable store paths every N seconds while serving (0 = off)
+    \\  --gc                 run one collection, print the report, and exit
     \\  --stdio              serve single connection over stdin/stdout
     \\  -h, --help           print this help message
 ;
@@ -25,6 +28,9 @@ pub fn run(process: ProcessContext, init: std.process.Init, args_iter: *std.proc
     var socket_path: ?[]const u8 = null;
     var sandbox_mode: store.daemon.SandboxMode = .none;
     var chroot_dir: ?[]const u8 = null;
+    var gcroots_dir: ?[]const u8 = null;
+    var gc_interval: u64 = 0;
+    var one_shot_gc = false;
     var use_stdio = false;
 
     var out_buf: [4096]u8 = undefined;
@@ -82,6 +88,34 @@ pub fn run(process: ProcessContext, init: std.process.Init, args_iter: *std.proc
         } else if (std.mem.startsWith(u8, arg, "--chroot=")) {
             chroot_dir = arg["--chroot=".len..];
             sandbox_mode = .chroot;
+        } else if (std.mem.eql(u8, arg, "--gc")) {
+            one_shot_gc = true;
+        } else if (std.mem.eql(u8, arg, "--gcroots")) {
+            gcroots_dir = args_iter.next() orelse {
+                stderr.print("error: expected directory path after --gcroots\n", .{}) catch {};
+                stderr.flush() catch {};
+                return 2;
+            };
+        } else if (std.mem.startsWith(u8, arg, "--gcroots=")) {
+            gcroots_dir = arg["--gcroots=".len..];
+        } else if (std.mem.eql(u8, arg, "--gc-interval")) {
+            const value = args_iter.next() orelse {
+                stderr.print("error: expected seconds after --gc-interval\n", .{}) catch {};
+                stderr.flush() catch {};
+                return 2;
+            };
+            gc_interval = std.fmt.parseInt(u64, value, 10) catch {
+                stderr.print("error: invalid --gc-interval value '{s}'\n", .{value}) catch {};
+                stderr.flush() catch {};
+                return 2;
+            };
+        } else if (std.mem.startsWith(u8, arg, "--gc-interval=")) {
+            const value = arg["--gc-interval=".len..];
+            gc_interval = std.fmt.parseInt(u64, value, 10) catch {
+                stderr.print("error: invalid --gc-interval value '{s}'\n", .{value}) catch {};
+                stderr.flush() catch {};
+                return 2;
+            };
         } else if (std.mem.eql(u8, arg, "--no-sandbox")) {
             sandbox_mode = .none;
         } else if (std.mem.startsWith(u8, arg, "--store=")) {
@@ -102,8 +136,24 @@ pub fn run(process: ProcessContext, init: std.process.Init, args_iter: *std.proc
         .socket_path = socket_path,
         .sandbox_mode = sandbox_mode,
         .chroot_dir = chroot_dir,
+        .gcroots_dir = gcroots_dir,
+        .gc_interval_seconds = gc_interval,
     });
     defer server.deinit();
+
+    if (one_shot_gc) {
+        var report = server.collectGarbage(false) catch |err| {
+            stderr.print("fix-daemon: garbage collection failed: {s}\n", .{@errorName(err)}) catch {};
+            stderr.flush() catch {};
+            return 1;
+        };
+        defer report.deinit();
+        stderr.print("fix-daemon: gc freed {d} paths ({d} bytes), {d} live, {d} roots\n", .{
+            report.freedCount(), report.freed_bytes, report.live_count, report.root_count,
+        }) catch {};
+        stderr.flush() catch {};
+        return 0;
+    }
 
     if (use_stdio) {
         var in_stream_buf: [64 * 1024]u8 = undefined;
